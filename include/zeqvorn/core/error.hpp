@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 miruku_sora2026
+
 // =============================================
 //
 // Created At  : 08 / 11 / 2026
