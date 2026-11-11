@@ -5,7 +5,7 @@
 //
 // Created At  : 08 / 11 / 2026
 //
-// Updated At  : 09 / 11 / 2026
+// Updated At  : 10 / 11 / 2026
 //
 // Created By  : miruku_sora2026
 //
@@ -22,8 +22,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <utility>
+#include <sys/types.h>
 
-#include "error.hpp"
 #include "result.hpp"
 
 namespace zeqvorn
@@ -151,7 +151,7 @@ namespace zeqvorn
         /**
          * @brief Releases ownership without closing.
          *
-         * @reutrn The previously owned descriptor.
+         * @return The previously owned descriptor.
          *
          * The caller becomes responsible for
          * closing the returned descriptor.
@@ -163,29 +163,29 @@ namespace zeqvorn
         }
 
         /**
-         * @brief Closed the current descriptor.
+         * @brief Closes or replaces the current descriptor.
          *
-         * @param new_fd Replacement descriptor.
+         * @param replacement Replacement descriptor.
          *
          * The previous descriptor is closed
          * unless it is invalid.
          *
-         * The replacement must not be the
-         * same descriptor currently owned.
+         * Passing the current descriptor leaves
+         * ownership unchanged and does not close it.
          *
-         * On Linux, close() must not be retired
+         * On Linux, close() must not be retried
          * after EINTR because the descriptor
-         * number way already have been released.
+         * number may already have been released.
          */
-        void reset(int new_fd = -1) noexcept
+        void reset(int replacement = -1) noexcept
         {
-            if (fd_ == new_fd) return;
+            if (fd_ == replacement) return;
 
-            int old_fd = std::exchange(fd_, new_fd);
+            int old = std::exchange(fd_, replacement);
 
-            if (old_fd >= 0)
+            if (old >= 0)
             {
-                ::close(old_fd);
+                (void)::close(old);
             }
         }
 
@@ -198,7 +198,7 @@ namespace zeqvorn
         }
 
         /**
-         * @brief Opens a file and takes ownership of ots FD.
+         * @brief Opens a file and takes ownership of its FD.
          *
          * @param path File system path.
          * @param flags Linux open flags.
@@ -206,7 +206,7 @@ namespace zeqvorn
          *
          * @return Result containing UniqueFd or Error.
          *
-         * 0_CL0EXEC prevents unintended descriptor
+         * O_CLOEXEC prevents unintended descriptor
          * inheritance across exec operations.
          *
          * This function doesn't automatically
@@ -219,7 +219,7 @@ namespace zeqvorn
             mode_t mode = 0644
         )
         {
-            if (path == nullptr)
+            if (!path)
             {
                 return Error(
                     ErrorCode::InvalidArgument,
@@ -227,20 +227,23 @@ namespace zeqvorn
                 );
             }
 
-            int fd = ::open(
+            const int fd = ::open(
                 path,
-                flags | 0_CL0EXEC,
+                flags | O_CLOEXEC,
                 mode
             );
 
             if (fd < 0)
             {
-                const int saved_errno = errno;
+                // 오류 메시지를 만들기 전에 errno를 저장한다.
+                // 문자열 생성이나 다른 함수 호출이 errno를 바꾸더라도
+                // 실제 open() 실패 원인을 그대로 전달할 수 있다.
+                const int saved_error = errno;
 
                 return Error::from_errno(
                     ErrorCode::IoError,
                     "Failed to open file",
-                    saved_errno
+                    saved_error
                 );
             }
 

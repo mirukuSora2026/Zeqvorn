@@ -5,14 +5,14 @@
 //
 // Created At  : 09 / 11 / 2026
 //
-// Updated At  : 09 / 11 / 2026
+// Updated At  : 10 / 11 / 2026
 //
 // Created By  : miruku_sora2026
 //
-// File Name   : process_handle.hpp
+// File Name   : process_manager.cpp
 //
-// Explanation : Manages a child process handle,
-//               its lifecycle, and exit status.
+// Explanation : Creates Linux child processes with pidfd handles,
+//               output capture, and exec failure reporting.
 //
 // =============================================
 
@@ -20,245 +20,295 @@
 #define _GNU_SOURCE
 #endif
 
-#include "../../include/zeqvorn/process/process_manager.hpp"
-#include "../../include/zeqvorn/core/unique_fd.hpp"
+#include "zeqvorn/process/process_manager.hpp"
 
 #include <cerrno>
-#include <complex>
+#include <cstddef>
 #include <csignal>
 #include <fcntl.h>
-#include <sys/types.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
-extern "C" {
-    extern char** environ;
-}
+// environ : execve()에 현재 프로세스의 환경 변수를 전달하기 위한 POSIX 전역 변수이다.
+extern "C" char** environ;
 
 namespace zeqvorn
 {
     namespace
     {
         /**
-         * @brief Waits until a child is reaped.
+         * @brief Owns both ends of a close-on-exec pipe.
          *
-         * Retries waitpid() when interrupted
-         * by a signal.
+         * Each endpoint has independent RAII ownership, so returning an
+         * error during setup closes every endpoint already acquired.
          */
-        void reap_child(pid_t pid) noexcept
+        struct Pipe
+        {
+            UniqueFd read;
+            UniqueFd write;
+        };
+
+        /**
+         * @brief Ensures that a pipe FD is above 2.
+         *
+         * Prevents descriptor aliasing with
+         * stdin, stdout and stderr during dup2().
+         *
+         * @param fd Owned pipe endpoint, possibly allocated as 0, 1, or 2
+         *           when a standard descriptor was previously closed.
+         * @return The original endpoint or a close-on-exec duplicate >= 3.
+         *
+         * The old low-numbered endpoint closes when this function returns.
+         * This keeps later child redirection from overwriting a pipe that
+         * is still needed for another stream or exec error reporting.
+         */
+        [[nodiscard]]
+        Result<UniqueFd> promote(UniqueFd fd)
+        {
+            if (fd.get() >= 3)
+            {
+                return fd;
+            }
+
+            const int high = ::fcntl(
+                fd.get(),
+                F_DUPFD_CLOEXEC,
+                3
+            );
+
+            if (high < 0)
+            {
+                const int saved = errno;
+
+                return Error::from_errno(
+                    ErrorCode::SystemError,
+                    "fcntl(F_DUPFD_CLOEXEC) failed",
+                    saved
+                );
+            }
+
+            return UniqueFd(high);
+        }
+
+        /**
+         * @brief Creates a pipe whose endpoints are safe for redirection.
+         *
+         * @return Two owned descriptors >= 3, or a saved setup error.
+         *
+         * O_CLOEXEC is set atomically by pipe2(). In particular, the exec
+         * error pipe's writer must close when execve() succeeds so the
+         * parent can observe EOF without waiting for program termination.
+         */
+        [[nodiscard]]
+        Result<Pipe> make_pipe()
+        {
+            int raw[2] = {-1, -1};
+
+            if (::pipe2(raw, O_CLOEXEC) < 0)
+            {
+                const int saved = errno;
+
+                return Error::from_errno(
+                    ErrorCode::SystemError,
+                    "pipe2() failed",
+                    saved
+                );
+            }
+
+            UniqueFd read(raw[0]);
+            UniqueFd write(raw[1]);
+
+            auto high_read = promote(
+                std::move(read)
+            );
+
+            if (!high_read)
+            {
+                return high_read.error();
+            }
+
+            auto high_write = promote(
+                std::move(write)
+            );
+
+            if (!high_write)
+            {
+                return high_write.error();
+            }
+
+            return Pipe{
+                std::move(high_read).value(),
+                std::move(high_write).value()
+            };
+        }
+
+        /**
+         * @brief Makes the parent's capture endpoint non-blocking.
+         *
+         * @param fd Borrowed read endpoint; ownership remains with Pipe.
+         * @return Success or the saved fcntl() error.
+         *
+         * Existing status flags are preserved. Only read endpoints use
+         * O_NONBLOCK; the child retains ordinary blocking output writes.
+         * collect() can then drain either stream without waiting forever
+         * for bytes from the other one.
+         */
+        [[nodiscard]]
+        Result<void> set_nonblocking(int fd)
+        {
+            const int flags = ::fcntl(
+                fd,
+                F_GETFL
+            );
+
+            if (flags < 0 ||
+                ::fcntl(
+                    fd,
+                    F_SETFL,
+                    flags | O_NONBLOCK
+                ) < 0)
+            {
+                const int saved = errno;
+
+                return Error::from_errno(
+                    ErrorCode::SystemError,
+                    "fcntl(O_NONBLOCK) failed",
+                    saved
+                );
+            }
+
+            return {};
+        }
+
+        /**
+         * @brief Reaps a specific direct child.
+         *
+         * Retries when waitpid() is interrupted
+         * by EINTR.
+         *
+         * @param pid Positive PID of a child created by this launcher.
+         *
+         * Used on a failed launch, where no ProcessHandle will be returned.
+         * It never waits for unrelated children and cannot report another
+         * error without replacing the original setup or exec failure.
+         */
+        void wait_child_best_effort(
+            pid_t pid
+        ) noexcept
         {
             int status = 0;
 
-            while (::waitpid(pid, &status, 0) == -1 &&
-                   errno == EINTR)
+            while (
+                ::waitpid(pid, &status, 0) == -1 &&
+                errno == EINTR
+            )
             {
             }
         }
 
         /**
-         * @brief Terminates and reaps a child.
+         * @brief Terminates and reaps a newly created child.
          *
-         * Used when the parent cannot reliably
-         * complete the startup handshake.
+         * Assumes the child has not been reaped
+         * by another thread or signal handler.
          *
-         * Assumes exclusive wait responsibility
-         * for this child process.
+         * @param pid Positive PID returned by fork() in the parent.
+         *
+         * This helper is limited to the direct child and does not terminate
+         * descendants. Blocking reaping is attempted only when SIGKILL was
+         * delivered or the child has already disappeared. On other signal
+         * failures, a nonblocking reap avoids hanging the failed launch.
+         *
+         * Cleanup is best effort: a denied signal can leave the child running
+         * or unreaped, and a failed spawn returns no ProcessHandle for it.
+         * The original errno is preserved for the launch error's caller.
          */
-        void terminate_and_reap(pid_t pid) noexcept
-        {
-            (void)::kill(pid, SIGKILL);
-            reap_child(pid);
-        }
-
-        /**
-         * @brief Checks for embedded NUL bytes.
-         *
-         * execve() expects NUL-terminated
-         * C strings for its arguments.
-         */
-        bool contains_nul(
-            const std::string& value
+        void kill_and_reap_new_child(
+            pid_t pid
         ) noexcept
         {
-            return value.find('\0') !=
-                   std::string::npos;
-        }
-    }
+            const int original_errno = errno;
+            int signal_result;
+            int signal_error;
 
-    /**
-     * @brief Creates  new child process.
-     *
-     * Execution sequence.
-     *
-     * 1. Validate the configuration.
-     * 2. Prepare executable arguments.
-     * 3. Create an error-reporting pipe.
-     * 4. Fork the current process.
-     * 5. Execute the requested program.
-     * 6. Verify execve() success or failure.
-     * 7. Return ProcessHandle or Error.
-     */
-    Result<ProcessHandle> ProcessManager::spawn(
-        const ProcessConfig& config
-    )
-    {
-        // Validate the executable path.
-        if (config.executable.empty() ||
-            contains_nul(config.executable))
-        {
-            return Error(
-                ErrorCode::InvalidArgument,
-                "Executable path is empty or contains a NUL byte"
-            );
-        }
-
-        // Validate every argument.
-        for (const auto& argument : config.arguments)
-        {
-            if (contains_nul(argument))
+            do
             {
-                return Error(
-                    ErrorCode::InvalidArgument,
-                    "An argument contains a NUL byte"
-                );
+                signal_result = ::kill(pid, SIGKILL);
+                signal_error = signal_result < 0 ? errno : 0;
             }
+            while (signal_result < 0 && signal_error == EINTR);
+
+            if (signal_result == 0 || signal_error == ESRCH)
+            {
+                wait_child_best_effort(pid);
+            }
+            else
+            {
+                // 권한 등의 이유로 종료를 요청하지 못했다면 살아 있는 자식을
+                // 무기한 기다리지 않는다. 이미 종료한 경우에만 상태를 회수한다.
+                int status = 0;
+
+                while (
+                    ::waitpid(pid, &status, WNOHANG) == -1 &&
+                    errno == EINTR
+                )
+                {
+                }
+            }
+
+            errno = original_errno;
         }
 
         /**
-         * Prepare argv before fork().
+         * @brief Reports execve() failure to the parent.
          *
-         * argv[0] contains the program name.
-         * The array must end with nullptr.
-         */
-        std::vector<std::string> argument_storage;
-
-        argument_storage.reserve(
-            config.arguments.size() + 1
-        );
-
-        argument_storage.push_back(
-            config.executable
-        );
-
-        for (const auto& argument : config.arguments)
-        {
-            argument_storage.push_back(argument);
-        }
-
-        std::vector<char*> argv;
-
-        argv.reserve(
-            argument_storage.size() + 1
-        );
-
-        for (auto& argument : argument_storage)
-        {
-            argv.push_back(argument.data());
-        }
-
-        argv.push_back(nullptr);
-
-        // Save pointers before creating the child.
-        const char* const executable =
-            argument_storage.front().c_str();
-
-        char* const* const exec_argv = argv.data();
-
-        // Inherit the parent's environment.
-        char* const* const exec_env = ::environ;
-
-        /**
-         * Create a pipe used only for reporting
-         * execve() failures to the parent.
+         * Only async-signal-safe operations
+         * are used in the forked child.
          *
-         * 0_CL0EXEC closes the descriptors
-         * automatically after successful exec.
-         */
-        int pipe_fds[2] = {-1, -1};
-
-        if (::pipe2(pipe_fds, O_CLOEXEC) == -1)
-        {
-            const int saved_errno = errno;
-
-            return Error::from_errno(
-                ErrorCode::SystemError,
-                "pipe2() failed",
-                saved_errno
-            );
-        }
-
-        UniqueFd read_end(pipe_fds[0]);
-        UniqueFd write_end(pipe_fds[1]);
-
-        const int child_read_fd = read_end.get();
-        const int child_write_fd = write_end.get();
-
-        /**
-         * Create a child process
+         * @param error_fd Borrowed writer of the private exec error pipe.
+         * @param err errno saved at the failing dup2() or execve() call.
          *
-         * fork() returns:
-         *     -1 : failure
-         *      0 : child process
-         *      1 : parent process (child PID)
+         * The pipe protocol is one native int containing errno. Interrupted
+         * and partial writes are handled without allocation or logging.
+         * _exit() bypasses C++ destructors and inherited stdio buffers;
+         * exit() could flush the parent's buffered output a second time.
          */
-        const pid_t pid = ::fork();
-
-        if (pid == -1)
+        [[noreturn]]
+        void child_exec_failure(
+            int error_fd,
+            int err
+        ) noexcept
         {
-            const int saved_errno = errno;
-
-            return Error::from_errno(
-                ErrorCode::ProcessCreationFailed,
-                "fork() failed",
-                saved_errno
-            );
-        }
-
-        /**
-         * Child process.
-         *
-         * After fork(), avoid operations that
-         * are not async-signal-safe before exec
-         */
-        if (pid == 0)
-        {
-            (void)::close(child_read_fd);
-
-            ::execve(
-                executable,
-                exec_argv,
-                exec_env
-            );
-
-            // This code executes only if execve fails.
-            const int exec_errno = errno;
-
-            const char* bytes =
+            const auto* bytes =
                 reinterpret_cast<const char*>(
-                    &exec_errno
+                    &err
                 );
 
-            std::size_t written = 0;
+            std::size_t offset = 0;
 
-            // Report the error to the parent.
-            while (written < sizeof(exec_errno))
+            while (offset < sizeof(err))
             {
                 const ssize_t n = ::write(
-                    child_write_fd,
-                    bytes + written,
-                    sizeof(exec_errno) - written
+                    error_fd,
+                    bytes + offset,
+                    sizeof(err) - offset
                 );
 
                 if (n > 0)
                 {
-                    written += static_cast<std::size_t>(n);
+                    offset +=
+                        static_cast<std::size_t>(n);
+
                     continue;
                 }
 
-                if (n == -1 && errno == EINTR)
+                if (n < 0 && errno == EINTR)
                 {
                     continue;
                 }
@@ -266,40 +316,346 @@ namespace zeqvorn
                 break;
             }
 
-            ::exit(127);
+            ::_exit(127);
         }
 
-        /** Parent process.
+        /**
+         * @brief Checks strings for embedded NUL bytes.
          *
-         * Close the parent's write end.
-         * The child is now responsible for
-         * writing an error if execve fails.
+         * C++ strings can store NUL bytes, but execve() consumes terminated
+         * C strings. Rejecting embedded NUL prevents silent truncation of
+         * the executable path or arguments at the system call boundary.
          */
-        write_end.reset();
+        [[nodiscard]]
+        bool has_nul(
+            const std::string& text
+        ) noexcept
+        {
+            return text.find('\0') !=
+                std::string::npos;
+        }
+    }
 
-        int child_errno = 0;
-        std::size_t received = 0;
+    /**
+     * @brief Implements the parent/child launch and ownership handshake.
+     *
+     * The private error pipe distinguishes exec failure from a program
+     * that starts normally and later exits with code 127. Successful exec
+     * closes its writer through O_CLOEXEC; a setup failure writes errno
+     * before exiting. Output pipes are separate from this protocol.
+     */
+    Result<ProcessHandle> ProcessManager::spawn(
+        const ProcessConfig& config
+    )
+    {
+        // execve()는 C 문자열을 받으므로 빈 경로와 중간 NUL 문자를 먼저 거부한다.
+        if (config.executable.empty() ||
+            has_nul(config.executable))
+        {
+            return Error(
+                ErrorCode::InvalidArgument,
+                "Invalid executable path"
+            );
+        }
+
+        // 각 인자의 문자열 경계도 검사하여 실제로 전달되는 값이 잘리지 않도록 한다.
+        for (const auto& argument : config.arguments)
+        {
+            if (has_nul(argument))
+            {
+                return Error(
+                    ErrorCode::InvalidArgument,
+                    "Process argument contains a NUL byte"
+                );
+            }
+        }
 
         /**
-         * Read the child's execution result.
+         * Prepare argv before fork().
          *
-         * EOF without data:
-         *     execve() succeeded.
-         *
-         * Complete errno value:
-         *     execve() failed.
+         * Argument storage and pointer allocations happen in the parent.
+         * Build all strings before taking data() pointers, then append the
+         * null sentinel required by execve(). No container is mutated in
+         * the child, so these pointers remain valid until exec or _exit.
          */
-        while (received < sizeof(child_errno))
+        std::vector<std::string> arg_storage;
+
+        arg_storage.reserve(
+            config.arguments.size() + 1
+        );
+
+        arg_storage.push_back(
+            config.executable
+        );
+
+        for (const auto& arg : config.arguments)
         {
-            auto* bytes =
-                reinterpret_cast<char*>(
-                    &child_errno
+            arg_storage.push_back(arg);
+        }
+
+        std::vector<char*> argv;
+
+        argv.reserve(
+            arg_storage.size() + 1
+        );
+
+        for (auto& arg : arg_storage)
+        {
+            argv.push_back(arg.data());
+        }
+
+        argv.push_back(nullptr);
+
+        // 실행 성공/실패 통지는 stdout 및 stderr와 독립된 파이프를 사용한다.
+        auto exec_pipe_result = make_pipe();
+
+        if (!exec_pipe_result)
+        {
+            return exec_pipe_result.error();
+        }
+
+        Pipe exec_pipe =
+            std::move(exec_pipe_result).value();
+
+        // stdout의 읽기 끝만 비차단으로 바꾸고, 쓰기 끝은 자식의 일반 출력에 사용한다.
+        std::optional<Pipe> out_pipe;
+
+        if (config.capture_stdout)
+        {
+            auto pipe = make_pipe();
+
+            if (!pipe)
+            {
+                return pipe.error();
+            }
+
+            out_pipe.emplace(
+                std::move(pipe).value()
+            );
+
+            auto set = set_nonblocking(
+                out_pipe->read.get()
+            );
+
+            if (!set)
+            {
+                return set.error();
+            }
+        }
+
+        // stderr는 별도 파이프로 유지하여 두 스트림을 각각 수집할 수 있도록 한다.
+        std::optional<Pipe> err_pipe;
+
+        if (config.capture_stderr)
+        {
+            auto pipe = make_pipe();
+
+            if (!pipe)
+            {
+                return pipe.error();
+            }
+
+            err_pipe.emplace(
+                std::move(pipe).value()
+            );
+
+            auto set = set_nonblocking(
+                err_pipe->read.get()
+            );
+
+            if (!set)
+            {
+                return set.error();
+            }
+        }
+
+        // fork() 이후 자식에서 문자열이나 벡터를 조작하지 않도록 포인터를 준비한다.
+        const char* const executable =
+            arg_storage.front().c_str();
+
+        char* const* const exec_argv =
+            argv.data();
+
+        char* const* const exec_env =
+            ::environ;
+
+        // Create child process.
+        const pid_t pid = ::fork();
+
+        if (pid < 0)
+        {
+            const int saved = errno;
+
+            return Error::from_errno(
+                ErrorCode::ProcessCreationFailed,
+                "fork() failed",
+                saved
+            );
+        }
+
+        /**
+         * Child process.
+         *
+         * Avoid allocations, logging and
+         * non-async-signal-safe operations.
+         */
+        if (pid == 0)
+        {
+            (void)::close(
+                exec_pipe.read.get()
+            );
+
+            // dup2()가 만든 표준 출력 복제본은 execve() 이후에도 열린 상태로 남는다.
+            if (out_pipe)
+            {
+                (void)::close(
+                    out_pipe->read.get()
                 );
 
+                if (::dup2(
+                    out_pipe->write.get(),
+                    STDOUT_FILENO
+                ) < 0)
+                {
+                    child_exec_failure(
+                        exec_pipe.write.get(),
+                        errno
+                    );
+                }
+
+                (void)::close(
+                    out_pipe->write.get()
+                );
+            }
+
+            // 사용하지 않는 읽기 끝과 복제 후의 원래 쓰기 끝은 즉시 닫는다.
+            if (err_pipe)
+            {
+                (void)::close(
+                    err_pipe->read.get()
+                );
+
+                if (::dup2(
+                    err_pipe->write.get(),
+                    STDERR_FILENO
+                ) < 0)
+                {
+                    child_exec_failure(
+                        exec_pipe.write.get(),
+                        errno
+                    );
+                }
+
+                (void)::close(
+                    err_pipe->write.get()
+                );
+            }
+
+            // Replace child image with executable.
+            ::execve(
+                executable,
+                exec_argv,
+                exec_env
+            );
+
+            // execve() returns only on failure.
+            child_exec_failure(
+                exec_pipe.write.get(),
+                errno
+            );
+        }
+
+        /**
+         * Parent process.
+         *
+         * Keep only the read ends of stdout and stderr pipes. Closing
+         * every parent-side writer is necessary for collect() to see EOF
+         * after the child's writers close.
+         */
+        exec_pipe.write.reset();
+
+        if (out_pipe)
+        {
+            out_pipe->write.reset();
+        }
+
+        if (err_pipe)
+        {
+            err_pipe->write.reset();
+        }
+
+        /**
+         * Acquire a pidfd.
+         *
+         * pidfd provides a stable reference to a process
+         * and helps prevent PID reuse issues.
+         */
+
+        // 조건부 컴파일 밖에서 선언하여 syscall 번호가 없는 빌드도 문법적으로 유효하게 한다.
+        UniqueFd pidfd;
+
+#if defined(SYS_pidfd_open)
+
+        const long raw_pidfd = ::syscall(
+            SYS_pidfd_open,
+            pid,
+            0U
+        );
+
+        if (raw_pidfd < 0)
+        {
+            const int saved = errno;
+
+            kill_and_reap_new_child(pid);
+
+            return Error::from_errno(
+                saved == ENOSYS
+                    ? ErrorCode::Unsupported
+                    : ErrorCode::SystemError,
+                "pidfd_open() failed",
+                saved
+            );
+        }
+
+        // Transfer ownership to the RAII wrapper.
+        pidfd.reset(
+            static_cast<int>(raw_pidfd)
+        );
+
+#else
+
+        kill_and_reap_new_child(pid);
+
+        return Error(
+            ErrorCode::Unsupported,
+            "pidfd_open is not available on this platform"
+        );
+
+#endif
+
+        /**
+         * Wait for execve() success or failure.
+         *
+         * O_CLOEXEC closes the child's write
+         * descriptor on successful execve().
+         *
+         * EOF without error bytes means success.
+         */
+        int exec_errno = 0;
+
+        auto* bytes =
+            reinterpret_cast<char*>(
+                &exec_errno
+            );
+
+        std::size_t received = 0;
+
+        while (received < sizeof(exec_errno))
+        {
             const ssize_t n = ::read(
-                read_end.get(),
+                exec_pipe.read.get(),
                 bytes + received,
-                sizeof(child_errno) - received
+                sizeof(exec_errno) - received
             );
 
             if (n > 0)
@@ -320,47 +676,63 @@ namespace zeqvorn
                 continue;
             }
 
-            const int saved_errno = errno;
+            const int saved = errno;
 
-            read_end.reset();
-            terminate_and_reap(pid);
+            kill_and_reap_new_child(pid);
 
             return Error::from_errno(
                 ErrorCode::SystemError,
-                "Failed to read child exec status",
-                saved_errno
+                "exec handshake read() failed",
+                saved
             );
         }
 
-        read_end.reset();
-
-        /**
-         * No error bytes were received.
-         *
-         * The executable was loaded successfully.
-         * Its eventual exit status is still unknown.
-         */
-        if (received == 0)
+        // Child reported execve() failure.
+        if (received == sizeof(exec_errno))
         {
-            return ProcessHandle(pid);
+            wait_child_best_effort(pid);
+
+            return Error::from_errno(
+                ErrorCode::ExecutionFailed,
+                "execve() failed: " +
+                    config.executable,
+                exec_errno
+            );
         }
 
-        // Execution failed: reap the child.
-        reap_child(pid);
-
-        if (received != sizeof(child_errno))
+        // Incomplete protocol response.
+        if (received != 0)
         {
+            kill_and_reap_new_child(pid);
+
             return Error(
                 ErrorCode::InternalError,
-                "Incomplete execve error report"
+                "Incomplete child exec failure protocol"
             );
         }
 
-        return Error::from_errno(
-            ErrorCode::ExecutionFailed,
-            "execve() failed for " +
-                config.executable,
-            child_errno
+        // Transfer captured read descriptors.
+        UniqueFd stdout_fd;
+        UniqueFd stderr_fd;
+
+        if (out_pipe)
+        {
+            stdout_fd =
+                std::move(out_pipe->read);
+        }
+
+        if (err_pipe)
+        {
+            stderr_fd =
+                std::move(err_pipe->read);
+        }
+
+        return ProcessHandle(
+            pid,
+            std::move(pidfd),
+            std::move(stdout_fd),
+            std::move(stderr_fd)
         );
     }
 }
+

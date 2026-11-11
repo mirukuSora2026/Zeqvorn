@@ -5,7 +5,7 @@
 //
 // Created At  : 08 / 11 / 2026
 //
-// Updated At  : 08 / 11 / 2026
+// Updated At  : 09 / 11 / 2026
 //
 // Created By  : miruku_sora2026
 //
@@ -48,21 +48,25 @@ namespace zeqvorn
     template <typename T>
     class [[nodiscard]] Result
     {
-        static_assert(!std::is_void_v<T>,
-            "Use Result<void> specialization.");
+        static_assert(
+            !std::is_void_v<T>,
+            "Use Result<void>"
+        );
 
-        static_assert(!std::is_reference_v<T>,
-            "Result<T> cannot store references.");
+        static_assert(
+            !std::is_reference_v<T>,
+            "References are not supported"
+        );
 
-        static_assert(!std::is_same_v<
-            std::remove_cv_t<T>, Error>,
-            "Result<Error> is not supported.");
+        static_assert(
+            !std::is_same_v<std::remove_cv_t<T>, Error>,
+            "Result<Error> is ambiguous"
+        );
 
-        static_assert(std::is_object_v<T>,
-            "Result<T> requires an object type.");
-
-        static_assert(std::is_destructible_v<T>,
-            "Result<T> requires a destructible type.");
+        static_assert(
+            std::is_object_v<T>,
+            "Result<T> requires an object type"
+        );
 
     private:
         /**
@@ -345,7 +349,7 @@ namespace zeqvorn
          */
         void value() const
         {
-            std::get<0>(data_);
+            (void)std::get<0>(data_);
         }
 
         /**
