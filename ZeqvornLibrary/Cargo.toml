@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 miruku_sora2026
+
+[package]
+name = "zeqvorn-library"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[build-dependencies]
+cmake = "0.1"
