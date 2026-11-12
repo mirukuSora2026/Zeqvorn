@@ -37,7 +37,14 @@ set_target_properties(zeqvorn_vm PROPERTIES
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     enable_language(OBJCXX)
-    target_sources(zeqvorn_vm PRIVATE native/macos_vz.mm)
+    target_sources(zeqvorn_vm PRIVATE
+            native/macos_vz.mm
+            native/macos_vz_boot.mm
+    )
+
+    set_source_files_properties(native/macos_vz_boot.mm
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+    )
 
     set_target_properties(zeqvorn_vm PROPERTIES
             OBJCXX_STANDARD 20

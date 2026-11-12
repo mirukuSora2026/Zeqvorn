@@ -77,6 +77,29 @@ uint32_t zeqvorn_vm_abi_version(void);
  */
 ZeqvornVmStatus zeqvorn_vm_probe(ZeqvornVmProbe* result);
 
+/** @brief Contains a null-terminated diagnostic for a boot failure. */
+typedef struct ZeqvornVmBootError
+{
+    char message[512];
+} ZeqvornVmBootError;
+
+/**
+ * @brief Boots Linux with an initramfs and waits for guest shutdown.
+ * @param kernel_path Null-terminated path to the host-native Linux kernel.
+ * @param initramfs_path Null-terminated path to the matching initramfs.
+ * @param error Writable diagnostic initialized on each call with a non-null output.
+ * @return A ZeqvornVmStatus. Null or empty paths and a null output are invalid.
+ *
+ * The VM connects its serial console to this process's standard input and
+ * output. Keep both path strings valid until the function returns.
+ * A host with no Linux boot implementation returns ZEQVORN_VM_UNAVAILABLE.
+ */
+ZeqvornVmStatus zeqvorn_vm_run_linux(
+    const char* kernel_path,
+    const char* initramfs_path,
+    ZeqvornVmBootError* error
+);
+
 #ifdef __cplusplus
 }
 #endif

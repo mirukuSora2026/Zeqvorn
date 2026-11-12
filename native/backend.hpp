@@ -18,9 +18,19 @@
 #pragma once
 
 #include "zeqvorn_vm.h"
+#include "../include/zeqvorn_vm.h"
 
 namespace zeqvorn::vm
 {
     /** @brief Populates the probe using the host OS's native API. */
     ZeqvornVmStatus probe_backend(ZeqvornVmProbe& result) noexcept;
+
+#if defined(__APPLE__)
+    /** @brief Runs the macOS guest and returns its final status. */
+    ZeqvornVmStatus run_linux_backend(
+        const char* kernel_path,
+        const char* initramfs_path,
+        ZeqvornVmBootError& error
+    ) noexcept;
+#endif
 }
