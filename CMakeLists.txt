@@ -35,7 +35,7 @@ set_target_properties(zeqvorn_vm PROPERTIES
         POSITION_INDEPENDENT_CODE ON
 )
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     enable_language(OBJCXX)
     target_sources(zeqvorn_vm PRIVATE
             native/macos_vz.mm
@@ -43,7 +43,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     )
 
     set_source_files_properties(native/macos_vz_boot.mm
-        PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
     )
 
     set_target_properties(zeqvorn_vm PROPERTIES
@@ -59,14 +59,31 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
             "${FOUNDATION_FRAMEWORK}"
             "${VIRTUALIZATION_FRAMEWORK}"
     )
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(zeqvorn_vm PRIVATE native/linux_kvm.cpp)
-elseif(WIN32)
+elseif (WIN32)
     target_sources(zeqvorn_vm PRIVATE native/windows_whp.cpp)
     target_compile_definitions(zeqvorn_vm PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-else()
+else ()
     message(FATAL_ERROR "Zeqvorn VM supports Windows, macOS, and Linux")
-endif()
+endif ()
 
+option(ZEQVORN_BUILD_ZF "Build the C++ YAML manifest parser" OFF)
+
+if (ZEQVORN_BUILD_ZF)
+    find_package(yaml-cpp CONFIG REQUIRED)
+
+    add_library(zeqvorn_zf STATIC src/zf/manifest.cpp)
+    add_library(zeqvorn::zf ALIAS zeqvorn_zf)
+
+    target_link_libraries(zeqvorn_zf
+            PUBLIC zeqvorn::common
+            PRIVATE yaml-cpp::yaml-cpp
+    )
+    set_target_properties(zeqvorn_zf PROPERTIES CXX_EXTENSIONS OFF)
+
+    install(TARGETS zeqvorn_zf ARCHIVE DESTINATION lib)
+
+endif ()
 install(TARGETS zeqvorn_vm ARCHIVE DESTINATION lib)
 install(DIRECTORY include/ DESTINATION include)
