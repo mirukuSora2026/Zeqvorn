@@ -1,0 +1,123 @@
+# Zeqvorn File Format (.zf)
+
+# Identifies the schema used to read this file.
+# Change this value only when migrating to a different schema version.
+schema-version: 1
+
+# Identifies the program and specifies how to launch it in the Linux guest.
+program:
+  # Stable identifier used to refer to the program.
+  id: "Zeqvorn-Test-Program"
+
+  # Version of the program, stored as a string.
+  version: "1.0"
+
+  # Display name shown to users.
+  name: "ZeqvornTestProgram (ZTP)"
+
+  # Short description shown in program information.
+  description: "Zeqvorn Test .zf File."
+
+  # Absolute path to the executable inside the Linux guest.
+  executable: "/usr/bin/zeqvorn-test-program"
+
+  # Guest ports declared by the program. Use [] for an empty list.
+  ports: []
+
+# Defines the arguments passed to the executable.
+args:
+  # Arguments placed immediately after the executable and before user arguments.
+  fixed: []
+
+  # Options the caller must supply. Each option takes one value.
+  required:
+    - flag: "--message"
+      type: string
+      description: "Text to print."
+
+  # Options the caller may supply. A declared default is used when omitted.
+  optional:
+    - flag: "--exit-code"
+      type: integer
+      default: 0
+      # Inclusive bounds for the accepted value.
+      min: 0
+      max: 255
+      description: "Exit status to return."
+
+# Defines how Zeqvorn interprets the program's exit status.
+exit-codes:
+  # Exit status that indicates success.
+  success: 0
+
+  # Maps integer exit statuses to messages shown to the caller.
+  # Zeqvorn also returns the original exit status.
+  messages:
+    7: "Test Exit Code."
+
+# Defines resource limits and output encoding for this program.
+process-info:
+  # CPU time limit, expressed as the equivalent number of CPU cores.
+  cpu: 2
+
+  # Maximum memory the program may use.
+  memory: "2GiB"
+
+  # Maximum size of the program's writable volume.
+  # Use null to leave the volume size uncapped by Zeqvorn.
+  disk-volume: "5GiB"
+
+  # Text encoding of the program's standard output and standard error.
+  format-type: "UTF-8"
+
+# Selects the Linux namespaces to create for the program.
+isolation:
+  # Gives the program a separate view of process IDs.
+  pid: true
+
+  # Gives the program a separate mount table.
+  mount: true
+
+  # Isolates interprocess communication resources.
+  ipc: true
+
+  # Gives the program a separate hostname and domain name.
+  uts: true
+
+  # Gives the program its own network interfaces and routing table.
+  network: true
+
+# Additional environment variables passed to the program.
+# Write each entry as a variable name with a string value.
+# Use {} when there are no additional variables.
+environment: {}
+
+# build field.
+# type : copy, download, unzip, add
+build:
+  platform: "linux/arm64"
+  steps:
+    - type: copy
+      from: "./dist/zeqvorn-test-program"
+      to: "/usr/bin/zeqvorn-test-program"
+      mode: "0755"
+
+#    - type: download
+#      url: <url>
+#      sha256: "<64 hexadecimal characters>"  # SHA-256 of the downloaded file.
+#      to: <file path>
+#      mode: "0755"
+
+    # unzip mode support file extension: .zip / .tar.gz
+#    - type: unzip
+#      from: <Absolute Path or Relative Path>
+#      to: <file path in Linux>
+#      sha256: [<file name>: <file SHA-256>, ...]
+#      mode: "0755"
+
+#   # add file.
+#    - type: add
+#      from: <Absolute Path or Relative Path>
+#      to: <file path in Linux>
+#      sha256: [<file name>: <file SHA-256>, ...]
+#      mode: "0755"
