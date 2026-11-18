@@ -5,7 +5,7 @@
 #
 # Created At  : 11 / 10 / 2026
 #
-# Updated At  : 11 / 12 / 2026
+# Updated At  : 11 / 16 / 2026
 #
 # Created By  : miruku_sora2026
 #
@@ -68,17 +68,30 @@ else ()
     message(FATAL_ERROR "Zeqvorn VM supports Windows, macOS, and Linux")
 endif ()
 
-option(ZEQVORN_BUILD_ZF "Build the C++ YAML manifest parser" OFF)
+option(ZEQVORN_BUILD_ZF "Build the C++ ZeqFile manifest and package readers" OFF)
 
 if (ZEQVORN_BUILD_ZF)
-    find_package(yaml-cpp CONFIG REQUIRED)
+    # Homebrew keeps libarchive under its own prefix. Keep caller-provided
+    # prefixes first and avoid searching host dependencies for cross builds.
+    if (APPLE AND NOT CMAKE_CROSSCOMPILING)
+        list(APPEND CMAKE_PREFIX_PATH
+                "/opt/homebrew/opt/libarchive"
+                "/usr/local/opt/libarchive"
+        )
+    endif ()
 
-    add_library(zeqvorn_zf STATIC src/zf/manifest.cpp)
+    find_package(yaml-cpp CONFIG REQUIRED)
+    find_package(LibArchive REQUIRED)
+
+    add_library(zeqvorn_zf STATIC
+            src/zf/manifest.cpp
+            src/zf/package.cpp
+    )
     add_library(zeqvorn::zf ALIAS zeqvorn_zf)
 
     target_link_libraries(zeqvorn_zf
             PUBLIC zeqvorn::common
-            PRIVATE yaml-cpp::yaml-cpp
+            PRIVATE yaml-cpp::yaml-cpp LibArchive::LibArchive
     )
     set_target_properties(zeqvorn_zf PROPERTIES CXX_EXTENSIONS OFF)
 
